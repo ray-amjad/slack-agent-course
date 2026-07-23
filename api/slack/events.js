@@ -6,6 +6,19 @@ const MIN = Number(process.env.RANDOM_MIN ?? 1);
 const MAX = Number(process.env.RANDOM_MAX ?? 100);
 
 /**
+ * Reads the untouched request body. Signature verification hashes the exact
+ * bytes Slack sent, so re-serialising a parsed object would not survive.
+ */
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+/**
  * Verifies the request actually came from Slack.
  * https://api.slack.com/authentication/verifying-requests-from-slack
  */
@@ -41,34 +54,42 @@ async function postThreadReply(channel, threadTs, text) {
   if (!data.ok) console.error("chat.postMessage failed:", data.error);
 }
 
-export default async function handler(request) {
-  if (request.method !== "POST") {
-    return new Response("Method Not Allowed", { status: 405 });
+function send(res, status, body) {
+  res.statusCode = status;
+  if (body === undefined) return res.end();
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(body));
+}
+
+export default async function handler(req, res) {
+  if (req.method !== "POST") return send(res, 405);
+
+  if (!SIGNING_SECRET || !BOT_TOKEN) {
+    console.error("Missing SLACK_SIGNING_SECRET or SLACK_BOT_TOKEN");
+    return send(res, 500);
   }
 
-  const rawBody = await request.text();
+  const rawBody = await readRawBody(req);
 
   if (
     !isValidSlackRequest(
       rawBody,
-      request.headers.get("x-slack-request-timestamp"),
-      request.headers.get("x-slack-signature"),
+      req.headers["x-slack-request-timestamp"],
+      req.headers["x-slack-signature"],
     )
   ) {
-    return new Response("Invalid signature", { status: 401 });
+    return send(res, 401);
   }
 
   const payload = JSON.parse(rawBody);
 
   // One-time URL verification when you point Slack at this endpoint.
   if (payload.type === "url_verification") {
-    return Response.json({ challenge: payload.challenge });
+    return send(res, 200, { challenge: payload.challenge });
   }
 
   // Slack retries if we're slow; don't post a duplicate number.
-  if (request.headers.get("x-slack-retry-num")) {
-    return new Response("", { status: 200 });
-  }
+  if (req.headers["x-slack-retry-num"]) return send(res, 200);
 
   const event = payload.event;
   if (event?.type === "app_mention" && !event.bot_id) {
@@ -81,5 +102,5 @@ export default async function handler(request) {
     );
   }
 
-  return new Response("", { status: 200 });
+  return send(res, 200);
 }
