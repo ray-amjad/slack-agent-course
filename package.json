@@ -1,0 +1,7 @@
+{
+  "name": "joestar-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Slack bot that replies in-thread with a random number when mentioned"
+}
