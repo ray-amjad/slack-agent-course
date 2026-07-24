@@ -29,4 +29,19 @@ export const template = Template()
     { user: "root" },
   )
   // Installed globally so the sandbox exposes it simply as `claude`.
-  .npmInstall("@anthropic-ai/claude-code@latest", { g: true });
+  .npmInstall("@anthropic-ai/claude-code@latest", { g: true })
+  // Playwright, for screenshotting/recording a locally-running app (e.g. a
+  // Next.js dev server) and dropping the result into /tmp/outputs. Installed
+  // globally like claude-code above, purely so `npx playwright` resolves
+  // without a per-run install.
+  .npmInstall("playwright@latest", { g: true })
+  // Bakes both the apt-level browser dependencies (--with-deps) and the
+  // ~170MB Chromium + ffmpeg binaries into the image itself, at build time.
+  // Without this, every run would repeat that apt-get + download before it
+  // could open a page — minutes of setup for what should be instant. Only
+  // Chromium: Firefox/WebKit aren't needed for local-app screenshots and
+  // recordings, and skipping them keeps the image smaller and the build
+  // faster.
+  .runCmd(["npx --yes playwright install --with-deps chromium"], {
+    user: "root",
+  });
