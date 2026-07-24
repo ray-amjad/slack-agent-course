@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import { waitUntil } from "@vercel/functions";
 
 import { BusyError, runClaude } from "../../lib/claude-sandbox.js";
+import { isConfigured as githubConfigured, mintInstallationToken } from "../../lib/github.js";
 import { toMrkdwn } from "../../lib/mrkdwn.js";
 import {
   addReaction,
@@ -162,6 +163,17 @@ function safeName(name, index) {
   return `${index}-${cleaned || "file"}`;
 }
 
+// What the model is told about its GitHub access. Spelling out the walls up
+// front is cheaper than letting it discover them by running into them: a run
+// that spends four minutes retrying a force-push is four minutes of Slack
+// silence. The `null` case says nothing at all — no App configured, no feature.
+const GITHUB_BRIEFING = {
+  ready:
+    "You have GitHub access this run. `gh` is authenticated (GH_TOKEN) and git is configured to match, so clone, branch, commit, push the branch, then `gh pr create` — which fails unless the branch is already pushed. Read the repository's real default branch and use that as the PR base; don't assume `main`. You cannot push directly to a protected default branch, force-push, delete branches, or change anything under `.github/workflows/` — those are refused by GitHub or blocked outright, so if you hit one, say so rather than working around it. The token expires in an hour. This thread's sandbox outlives it — a later message in the thread arrives with a freshly minted one, so don't stash this value anywhere expecting it to keep working.",
+  unavailable:
+    "You have no GitHub access this run — the installation token could not be minted. If the user asked for GitHub work, tell them that plainly instead of attempting it.",
+};
+
 /**
  * Assembles the final prompt: prior thread as untrusted DATA, the attachment
  * paths, the output-dir convention, then the user's text.
@@ -178,7 +190,7 @@ function safeName(name, index) {
  * replies twice, once here and once from the session. Repetitive, not incorrect;
  * narrowing the replay to "since my last reply" is a separate change.
  */
-function buildPrompt({ prompt, transcript, inputPaths }) {
+function buildPrompt({ prompt, transcript, inputPaths, github }) {
   const parts = [];
 
   if (transcript) {
@@ -199,11 +211,40 @@ function buildPrompt({ prompt, transcript, inputPaths }) {
     "To send a file or image back to the user, write it into /tmp/outputs/ — every file left in that directory is uploaded to the Slack thread after you finish.",
   );
 
+  if (github) parts.push(GITHUB_BRIEFING[github]);
+
   parts.push(
     `The user's message:\n${prompt || "Please look at the attached file(s) and respond."}`,
   );
 
   return parts.join("\n\n");
+}
+
+/**
+ * Mints the per-request GitHub token, eagerly.
+ *
+ * Eagerly, because the alternative is guessing from the text whether this
+ * request needs GitHub — and the request that most needs it is the threaded
+ * follow-up "now open a PR for that", which contains no keyword to guess from.
+ * The cost is one API call, after the Slack ack, on a path that already takes
+ * minutes. It is also deliberately uncached: one Slack message, one token, gone
+ * within the hour whatever happens to it in between.
+ *
+ * Three outcomes, and the difference between the last two matters: no App
+ * configured is the feature being off (`null` — say nothing), while a mint that
+ * failed is something the user should hear about.
+ *
+ * @returns {Promise<{token: string|null, status: 'ready'|'unavailable'|null}>}
+ */
+async function mintGithubToken() {
+  if (!githubConfigured()) return { token: null, status: null };
+  try {
+    const { token } = await mintInstallationToken();
+    return { token, status: "ready" };
+  } catch (err) {
+    console.error("GitHub token mint failed:", err.message);
+    return { token: null, status: "unavailable" };
+  }
 }
 
 /**
@@ -222,7 +263,9 @@ async function respond({ event, channel, threadTs, prompt, files, transcript }) 
     inputPaths.push(`/tmp/inputs/${name}`);
   }
 
-  const finalPrompt = buildPrompt({ prompt, transcript, inputPaths });
+  const github = await mintGithubToken();
+
+  const finalPrompt = buildPrompt({ prompt, transcript, inputPaths, github: github.status });
   const ts = await postThinking({ channel, threadTs });
 
   try {
@@ -231,13 +274,16 @@ async function respond({ event, channel, threadTs, prompt, files, transcript }) 
       inputFiles,
       channelId: channel,
       threadTs,
+      githubToken: github.token,
     });
     const body = text
       ? toMrkdwn(text)
       : outputFiles.length
         ? "_Done — see the attached file(s)._"
         : "_Claude returned an empty response._";
-    await finalize({ channel, threadTs, ts, text: truncate(body) });
+    const note =
+      github.status === "unavailable" ? "\n\n_GitHub access is unavailable this run._" : "";
+    await finalize({ channel, threadTs, ts, text: truncate(body) + note });
 
     for (const out of outputFiles) {
       try {
