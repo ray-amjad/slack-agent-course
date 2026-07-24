@@ -16,9 +16,16 @@ import {
   getBotUserId,
   postMessage,
   postThinking,
+  progressText,
   renderTranscript,
+  updateProgress,
   uploadFile,
 } from "../../lib/slack.js";
+
+// How often the "thinking" placeholder is edited with elapsed time and the
+// latest tool call. Short enough to feel live, long enough to stay well clear
+// of Slack's chat.update rate limits over a run that can last minutes.
+const PROGRESS_TICK_MS = 5000;
 
 const SIGNING_SECRET = process.env.SLACK_SIGNING_SECRET;
 const BOT_TOKEN = process.env.SLACK_BOT_TOKEN;
@@ -258,6 +265,11 @@ async function mintGithubToken() {
  * The full run: download attachments, post the placeholder, run Claude, edit
  * the placeholder with the (mrkdwn) answer, upload any artifacts, and stamp a
  * terminal reaction. 👀 stays on throughout as the "working" signal.
+ *
+ * While Claude runs, the placeholder itself ticks every PROGRESS_TICK_MS with
+ * elapsed time and a one-line description of whatever tool call it last
+ * started (`onProgress` below), so a long run doesn't sit on an unchanging
+ * "Thinking…" with no sign of life.
  */
 async function respond({ event, channel, threadTs, prompt, files, transcript }) {
   const inputFiles = [];
@@ -283,40 +295,52 @@ async function respond({ event, channel, threadTs, prompt, files, transcript }) 
     channelTopic,
   });
   const ts = await postThinking({ channel, threadTs });
+  const startedAt = Date.now();
+  let latestTool = null;
 
+  // No placeholder (postThinking already logged why) means nothing to edit —
+  // skip ticking rather than editing a message we never posted.
+  const tick = ts
+    ? setInterval(() => {
+        updateProgress({
+          channel,
+          ts,
+          text: progressText({ elapsedMs: Date.now() - startedAt, tool: latestTool }),
+        });
+      }, PROGRESS_TICK_MS)
+    : null;
+
+  // The interval must die the instant runClaude settles, before any of the
+  // finalize/upload/reaction calls below start awaiting — otherwise a tick
+  // firing during one of those awaits would overwrite the final answer we
+  // just wrote with a stale "still running" placeholder.
+  let outcome;
   try {
-    const { text, outputFiles = [] } = await runClaude({
+    const result = await runClaude({
       prompt: finalPrompt,
       inputFiles,
       channelId: channel,
       threadTs,
       githubToken: github.token,
+      onProgress: (tool) => {
+        latestTool = tool;
+      },
     });
-    const body = text
-      ? toMrkdwn(text)
-      : outputFiles.length
-        ? "_Done — see the attached file(s)._"
-        : "_Claude returned an empty response._";
-    const note =
-      github.status === "unavailable" ? "\n\n_GitHub access is unavailable this run._" : "";
-    await finalize({ channel, threadTs, ts, text: truncate(body) + note });
-
-    for (const out of outputFiles) {
-      try {
-        await uploadFile({ channel, threadTs, filename: out.name, data: out.data });
-      } catch (err) {
-        console.error(`upload ${out.name} failed:`, err.data?.error || err.message);
-      }
-    }
-
-    await addReaction({ channel, timestamp: event.ts, name: "white_check_mark" });
+    outcome = { ok: true, result };
   } catch (err) {
-    // Not a failure. The thread's sandbox is mid-turn, and one turn at a time
-    // is the rule that keeps its transcript intact (lib/claude-sandbox.js).
-    // Say so plainly, and stamp no terminal reaction: this message was never
-    // started, so neither ✅ nor ❌ would be true of it. 👀 stays as the record
-    // that we saw it.
-    if (err instanceof BusyError) {
+    outcome = { ok: false, error: err };
+  } finally {
+    if (tick) clearInterval(tick);
+  }
+
+  if (!outcome.ok) {
+    // Not a failure. The thread's sandbox is mid-turn, and one turn at a time is
+    // the rule that keeps its transcript intact (lib/claude-sandbox.js). Say so
+    // plainly, and stamp no terminal reaction: this message was never started,
+    // so neither ✅ nor ❌ would be true of it. 👀 stays as the record that we
+    // saw it. It sits below the ticker teardown so the placeholder is ours to
+    // overwrite by the time we do.
+    if (outcome.error instanceof BusyError) {
       await finalize({
         channel,
         threadTs,
@@ -325,10 +349,31 @@ async function respond({ event, channel, threadTs, prompt, files, transcript }) 
       });
       return;
     }
-    console.error("Claude run failed:", err);
-    await finalize({ channel, threadTs, ts, text: `:warning: ${truncate(err.message)}` });
+    console.error("Claude run failed:", outcome.error);
+    await finalize({ channel, threadTs, ts, text: `:warning: ${truncate(outcome.error.message)}` });
     await addReaction({ channel, timestamp: event.ts, name: "x" });
+    return;
   }
+
+  const { text, outputFiles = [] } = outcome.result;
+  const body = text
+    ? toMrkdwn(text)
+    : outputFiles.length
+      ? "_Done — see the attached file(s)._"
+      : "_Claude returned an empty response._";
+  const note =
+    github.status === "unavailable" ? "\n\n_GitHub access is unavailable this run._" : "";
+  await finalize({ channel, threadTs, ts, text: truncate(body) + note });
+
+  for (const out of outputFiles) {
+    try {
+      await uploadFile({ channel, threadTs, filename: out.name, data: out.data });
+    } catch (err) {
+      console.error(`upload ${out.name} failed:`, err.data?.error || err.message);
+    }
+  }
+
+  await addReaction({ channel, timestamp: event.ts, name: "white_check_mark" });
 }
 
 /**
