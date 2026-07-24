@@ -8,18 +8,19 @@ import { toMrkdwn } from "../../lib/mrkdwn.js";
 import {
   addReaction,
   botOwnsThread,
+  completeUpload,
   downloadSlackFile,
   extractPrompt,
   fetchChannelTopic,
   fetchThreadReplies,
   finalize,
   getBotUserId,
+  mintUploadURL,
   postMessage,
   postThinking,
   progressText,
   renderTranscript,
   updateProgress,
-  uploadFile,
 } from "../../lib/slack.js";
 
 // How often the "thinking" placeholder is edited with elapsed time and the
@@ -325,6 +326,11 @@ async function respond({ event, channel, threadTs, prompt, files, transcript }) 
       onProgress: (tool) => {
         latestTool = tool;
       },
+      // The sandbox never sees SLACK_BOT_TOKEN — it only gets the single-use
+      // upload URL this mints, then POSTs the bytes to Slack itself. Keeps
+      // large recordings off this function's own memory and out of Vercel's
+      // response-size limits entirely, instead of routing them through here.
+      onOutputFile: ({ filename, length }) => mintUploadURL({ filename, length }),
     });
     outcome = { ok: true, result };
   } catch (err) {
@@ -355,21 +361,29 @@ async function respond({ event, channel, threadTs, prompt, files, transcript }) 
     return;
   }
 
-  const { text, outputFiles = [] } = outcome.result;
+  const { text, uploadedFiles = [] } = outcome.result;
   const body = text
     ? toMrkdwn(text)
-    : outputFiles.length
+    : uploadedFiles.length
       ? "_Done — see the attached file(s)._"
       : "_Claude returned an empty response._";
   const note =
     github.status === "unavailable" ? "\n\n_GitHub access is unavailable this run._" : "";
   await finalize({ channel, threadTs, ts, text: truncate(body) + note });
 
-  for (const out of outputFiles) {
+  // The sandbox already POSTed the bytes to their minted URLs — this just
+  // finalizes and shares whatever made it, as one message with every
+  // attachment. A file that failed its POST was never added to
+  // uploadedFiles, so there's nothing to resolve or clean up for it.
+  if (uploadedFiles.length) {
     try {
-      await uploadFile({ channel, threadTs, filename: out.name, data: out.data });
+      await completeUpload({
+        channel,
+        threadTs,
+        files: uploadedFiles.map((f) => ({ id: f.fileId, title: f.name })),
+      });
     } catch (err) {
-      console.error(`upload ${out.name} failed:`, err.data?.error || err.message);
+      console.error("completeUpload failed:", err.data?.error || err.message);
     }
   }
 
