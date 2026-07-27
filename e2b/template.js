@@ -144,9 +144,25 @@ export const template = Template()
   // Chromium: Firefox/WebKit aren't needed for local-app screenshots and
   // recordings, and skipping them keeps the image smaller and the build
   // faster.
-  .runCmd(["npx --yes playwright install --with-deps chromium"], {
-    user: "root",
-  })
+  //
+  // PLAYWRIGHT_BROWSERS_PATH is the load-bearing part. This step runs as root,
+  // and Playwright installs browsers under $HOME — so without it they land in
+  // /root/.cache/ms-playwright, which the sandbox's `user` can neither find nor
+  // read. Playwright then greets the agent with "Executable doesn't exist at
+  // /home/user/.cache/ms-playwright/..." and tells it to run `playwright
+  // install`, re-downloading ~170MB at run time and defeating the point of
+  // baking Chromium in at all. Installing to a shared path outside any home
+  // directory fixes it for every user; lib/claude-sandbox.js passes the same
+  // path into the run so Playwright looks in the right place.
+  .runCmd(
+    [
+      "PLAYWRIGHT_BROWSERS_PATH=/ms-playwright npx --yes playwright install --with-deps chromium",
+      // a+rX (capital X) marks directories traversable and executables runnable
+      // without making every browser data file executable.
+      "chmod -R a+rX /ms-playwright",
+    ],
+    { user: "root" },
+  )
   // Postgres and Redis, so the agent can build and actually run something that
   // needs a datastore instead of stubbing one. Both are ordinary apt packages;
   // installing postgresql also creates the "main" cluster via its postinst,
