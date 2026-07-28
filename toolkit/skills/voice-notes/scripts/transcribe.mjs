@@ -62,8 +62,14 @@ function parseArgs(argv) {
     if (arg === "--diarize") opts.diarize = true;
     else if (arg === "--clean") opts.clean = true;
     else if (arg === "--json") opts.json = true;
-    else if (arg === "--language") opts.language = argv[++i];
-    else if (arg === "--timeout") opts.timeoutMs = Number(argv[++i]);
+    // Explicit, because the silent version of this is nasty: `--language` as
+    // the last argument sets `undefined`, `language_code` is simply never sent,
+    // and you get a plausible auto-detected transcript instead of an error —
+    // for the exact short/noisy clips the flag exists to rescue.
+    else if (arg === "--language") {
+      opts.language = argv[++i];
+      if (!opts.language) die(2, "--language needs a code, e.g. --language eng");
+    } else if (arg === "--timeout") opts.timeoutMs = Number(argv[++i]);
     else if (arg.startsWith("-")) die(2, `unknown flag ${arg}`);
     else if (opts.file) die(2, "one file at a time — call this once per attachment");
     else opts.file = arg;
@@ -151,17 +157,29 @@ if (!apiKey) {
 
 const { form, byteLength } = await buildForm(opts);
 
+// A thrown fetch — DNS blip, ECONNRESET, the AbortSignal firing — is as
+// transient as a 503, and used to be the one class that skipped the retry
+// entirely: it escaped straight to `die`, so a single dropped connection cost
+// the user their whole voice note. Both kinds of transient now take the same
+// path, and only a second failure is terminal.
 let result;
+let firstError = null;
 try {
   result = await post(form, opts.timeoutMs, apiKey);
-  if (!result.ok && isTransient(result.status)) {
-    console.error(`transcribe: HTTP ${result.status} — retrying once in ${RETRY_DELAY_MS / 1000}s`);
-    await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+} catch (err) {
+  firstError = err;
+}
+
+if (firstError || (!result.ok && isTransient(result.status))) {
+  const why = firstError ? firstError.message : `HTTP ${result.status}`;
+  console.error(`transcribe: ${why} — retrying once in ${RETRY_DELAY_MS / 1000}s`);
+  await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+  try {
     // FormData is single-use once consumed by fetch, so the retry rebuilds it.
     result = await post((await buildForm(opts)).form, opts.timeoutMs, apiKey);
+  } catch (err) {
+    die(1, `request failed twice: ${err.message}`);
   }
-} catch (err) {
-  die(1, `request failed: ${err.message}`);
 }
 
 if (!result.ok) {
@@ -179,7 +197,20 @@ if (opts.json) {
   process.exit(0);
 }
 
-const transcript = opts.diarize ? renderDiarized(data.words) : (data.text ?? "").trim();
+// Diarization degrades to the plain transcript rather than to nothing.
+// `renderDiarized` returns "" whenever the response has no `words` (or only
+// `audio_event` entries), which then hits the empty-transcript branch below and
+// announces that the audio was silent — while `data.text` holds a perfectly
+// good transcript of it. Wrong answer, delivered confidently.
+const plain = (data.text ?? "").trim();
+let transcript = plain;
+if (opts.diarize) {
+  transcript = renderDiarized(data.words);
+  if (!transcript && plain) {
+    console.error("transcribe: no per-word speaker data in the response — falling back to plain text");
+    transcript = plain;
+  }
+}
 
 const meta = [
   `model=${MODEL_ID}`,

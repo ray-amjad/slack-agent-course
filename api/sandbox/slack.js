@@ -2,6 +2,7 @@ import {
   fetchChannelInfo,
   fetchHistory,
   fetchThreadReplies,
+  isChannelMember,
   listConversations,
   readError,
   searchContext,
@@ -31,8 +32,12 @@ import { verifyCapability } from "../../lib/slack-proxy.js";
  * already use in lib/agent-memory.js: read down, never up.
  *
  * A run in a PRIVATE channel is not automatically trusted with everything
- * either — it can still only reach channels the bot was invited to, because
- * that is all a bot token can read.
+ * either. Two limits apply. The bot's own membership, because that is all a bot
+ * token can read at all. And the ASKER's membership, because the bot's is the
+ * wrong question: "Joestar was invited to #leadership" must not mean "anyone who
+ * can DM Joestar can read #leadership". A DM is a private conversation, so
+ * without that second check every workspace member would hold private tier by
+ * default and could page through channels they were deliberately left out of.
  */
 
 // Bounds on what one call can pull back, so a single request cannot blow up the
@@ -41,6 +46,11 @@ import { verifyCapability } from "../../lib/slack-proxy.js";
 const MAX_MESSAGES = 50;
 const MAX_CHANNELS = 200;
 const SEARCH_MAX = 20;
+
+// How many channels we PAGE THROUGH before filtering, as opposed to how many we
+// hand back. The two differ on purpose: matching a query against 200 channels
+// when the workspace has 900 is how a lookup silently returns nothing.
+const LIST_FETCH_MAX = 1000;
 
 // Long messages are usually pasted logs. Keep the shape, drop the bulk — the
 // agent can always ask for the thread if a truncated message looks important.
@@ -96,25 +106,53 @@ const clamp = (value, max, fallback) => {
   return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), max) : fallback;
 };
 
+function forbidden(message) {
+  const err = new Error(message);
+  err.status = 403;
+  return err;
+}
+
 /**
- * Enforces the tier rule for a specific target channel.
+ * The gate on every message read: may THIS run, asked by THIS person, see THIS
+ * channel?
  *
  * Costs one `conversations.info` call, which is the price of not trusting the
- * sandbox's word for what it is reading. Fails CLOSED: a lookup that errors
- * blocks the read rather than allowing it, for the same reason
- * `fetchChannelInfo` defaults `isPrivate` to true.
+ * sandbox's word for what it is reading, plus a `conversations.members` walk
+ * when the target turns out to be private. Fails CLOSED at every branch — a
+ * lookup that errors blocks the read rather than allowing it, for the same
+ * reason `fetchChannelInfo` defaults `isPrivate` to true.
  */
 async function assertReadable(channel, capability) {
-  if (capability.isPrivate) return; // a private run may read anything the bot can
+  // The channel this run is already answering in. Its recent messages are in
+  // the prompt before the sandbox starts, so a membership check here would deny
+  // access to something the model has been handed anyway — and it is the one
+  // case where `conversations.members` is awkward (DMs, group DMs) and would
+  // fail closed for the wrong reason.
+  if (channel === capability.channelId) return;
 
   const info = await fetchChannelInfo(channel);
-  if (info.isPrivate) {
-    const err = new Error(
+  if (!info.isPrivate && info.privacyKnown) return; // public target: open to any run
+
+  if (!capability.isPrivate) {
+    throw forbidden(
       "This run is answering in a public channel, so it may only read public channels. " +
         "That target is private (or could not be confirmed public). Ask the user to run this from the private channel itself.",
     );
-    err.status = 403;
-    throw err;
+  }
+
+  // Private target, private run: the bot can reach it, but that is not the
+  // question. Only the person who asked can authorise reading their own private
+  // channel into an answer.
+  if (!capability.userId) {
+    throw forbidden(
+      "That channel is private and this run cannot tell who is asking, so the read is refused.",
+    );
+  }
+  if (!(await isChannelMember(channel, capability.userId))) {
+    throw forbidden(
+      "That channel is private and the person who asked is not a member of it, so its contents are not theirs to read through Joestar. " +
+        "Joestar being in a channel does not grant access to everyone who can message Joestar.",
+    );
   }
 }
 
@@ -122,10 +160,13 @@ const ACTIONS = {
   /** Channels the workspace has, annotated with whether the bot can actually read each. */
   async channels(body, capability) {
     const types = capability.isPrivate ? "public_channel,private_channel" : "public_channel";
-    const channels = await listConversations({
-      types,
-      limit: clamp(body.limit, MAX_CHANNELS, MAX_CHANNELS),
-    });
+
+    // Fetch wide, THEN filter, THEN cap. Filtering a truncated page was the old
+    // shape and it lied: in a workspace past one page, `channels deploys`
+    // answered "(no channels matched)" for a channel that plainly exists, and
+    // since this is the only name→id lookup the agent has, it concluded the
+    // channel was gone rather than that the list ran out.
+    const { channels, truncated } = await listConversations({ types, limit: LIST_FETCH_MAX });
 
     const match = (body.query || "").trim().toLowerCase();
     const filtered = match
@@ -137,9 +178,18 @@ const ACTIONS = {
         )
       : channels;
 
+    const cap = clamp(body.limit, MAX_CHANNELS, MAX_CHANNELS);
+    const shown = filtered.slice(0, cap);
+    const clipped = truncated || filtered.length > shown.length;
+
     return {
-      channels: filtered,
-      note: "`isMember: false` means Joestar cannot read that channel's messages — it has to be invited first.",
+      channels: shown,
+      truncated: clipped,
+      note:
+        "`isMember: false` means Joestar cannot read that channel's messages — it has to be invited first." +
+        (clipped
+          ? ` This list is INCOMPLETE (${shown.length} of ${filtered.length}+ matched) — a channel missing from it may still exist. Narrow the query rather than concluding it does not.`
+          : ""),
     };
   },
 
@@ -249,7 +299,11 @@ export default async function handler(req, res) {
     return send(res, 400, { ok: false, error: err.message });
   }
 
-  const action = ACTIONS[body.action];
+  // hasOwn, not a bare lookup: `ACTIONS["constructor"]` resolves up the
+  // prototype chain to a truthy function, sails past this guard, and gets
+  // invoked as an action — returning 200 and an echo of the request body where
+  // a 400 belongs.
+  const action = Object.hasOwn(ACTIONS, body.action ?? "") ? ACTIONS[body.action] : null;
   if (!action) {
     return send(res, 400, {
       ok: false,

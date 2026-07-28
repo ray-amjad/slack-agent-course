@@ -385,11 +385,24 @@ async function respond({ event, channel, threadTs, prompt, files, transcript }) 
   // messages that @mention the app, so a threaded follow-up legitimately has
   // none — the proxy turns that into an explainable error rather than pretending
   // search is broken.
+  //
+  // `privacyKnown`, not just `isPrivate`. The memory tier a few lines down wants
+  // the cautious answer to be "private", and fetchChannelInfo obliges by
+  // defaulting there on any failure. The read capability wants the opposite:
+  // `priv: true` is what GRANTS private-channel reads, so inheriting that
+  // default would mean one rate-limited conversations.info silently upgrades a
+  // #general mention into a run that may read every private channel the bot is
+  // in — and summarise it into the public thread. An unconfirmed channel gets
+  // the public tier, which is the direction that fails closed HERE.
+  const grantsPrivateReads = channelInfo.isPrivate && channelInfo.privacyKnown;
   const slackCapability = proxyConfigured()
     ? mintCapability(
         {
           channelId: channel,
-          isPrivate: channelInfo.isPrivate,
+          isPrivate: grantsPrivateReads,
+          // Who asked — private reads are checked against their membership, not
+          // the bot's. See assertReadable in api/sandbox/slack.js.
+          userId: event.user ?? null,
           actionToken: event.action_token ?? null,
         },
         SLACK_CAPABILITY_TTL_MS,

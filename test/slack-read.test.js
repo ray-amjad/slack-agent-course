@@ -55,6 +55,7 @@ function defaultResponses() {
       messages: [{ ts: "1721304000.001200", user: "U04ABC", text: "parent", reply_count: 1 }],
     },
     "conversations.info": { ok: true, channel: { id: "C111", is_private: false } },
+    "conversations.members": { ok: true, members: ["U04ABC", "U05XYZ"] },
     // The real shape, taken from Slack's own SDK structs — NOT a message
     // object. `content`/`message_ts`/`channel_name` rather than
     // `text`/`ts`/`channel.name`. An earlier fixture guessed message-shaped
@@ -98,8 +99,14 @@ before(async () => {
     const method = target.split("/api/")[1].split("?")[0];
     slackCalls.push({ method, body: String(init?.body ?? "") });
 
-    const payload = slackResponses[method];
+    let payload = slackResponses[method];
     if (!payload) throw new Error(`unstubbed Slack method: ${method}`);
+    // A function stub gets the request's own arguments, which is what lets a
+    // test drive pagination — page two has to depend on the cursor page one
+    // handed back.
+    if (typeof payload === "function") {
+      payload = payload(Object.fromEntries(new URLSearchParams(String(init?.body ?? ""))));
+    }
     return new Response(JSON.stringify(payload), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -123,7 +130,8 @@ after(() => server?.close());
 
 const publicRun = () =>
   mintCapability({ channelId: "C111", isPrivate: false, actionToken: "act.1" }, 60_000);
-const privateRun = () => mintCapability({ channelId: "G333", isPrivate: true }, 60_000);
+const privateRun = (userId = "U04ABC") =>
+  mintCapability({ channelId: "G333", isPrivate: true, userId }, 60_000);
 
 /** Runs the CLI. `expectFailure` flips the assertion to "this must exit non-zero". */
 async function slackRead(args, { capability = publicRun(), expectFailure = false } = {}) {
@@ -163,6 +171,40 @@ describe("channels", () => {
     const out = await slackRead(["channels", "design"]);
     assert.match(out, /#design/);
     assert.doesNotMatch(out, /#deploys/);
+  });
+
+  it("pages past the first response to find a channel", async () => {
+    // The failure this replaces was a confident wrong answer, not an error: the
+    // filter ran on page one only, so a channel on page two came back as
+    // "(no channels matched)" — which the agent reports as "that channel
+    // doesn't exist" because listing is the only name→id lookup it has.
+    slackResponses["conversations.list"] = ({ cursor }) =>
+      cursor
+        ? { ok: true, channels: [{ id: "C777", name: "incidents", is_member: true }] }
+        : {
+            ok: true,
+            channels: [{ id: "C111", name: "deploys", is_member: true }],
+            response_metadata: { next_cursor: "page2" },
+          };
+
+    const out = await slackRead(["channels", "incidents"]);
+    assert.match(out, /C777 {2}#incidents/);
+
+    slackResponses["conversations.list"] = defaultResponses()["conversations.list"];
+  });
+
+  it("says the list is incomplete rather than implying the channel is gone", async () => {
+    slackResponses["conversations.list"] = () => ({
+      ok: true,
+      channels: [{ id: "C111", name: "deploys", is_member: true }],
+      response_metadata: { next_cursor: "endless" },
+    });
+
+    const out = await slackRead(["channels", "nowhere"]);
+    assert.match(out, /no channels matched/);
+    assert.match(out, /INCOMPLETE|may still exist/);
+
+    slackResponses["conversations.list"] = defaultResponses()["conversations.list"];
   });
 
   it("asks Slack for public channels only when the run is public", async () => {
@@ -236,12 +278,14 @@ describe("search", () => {
 
 describe("the tier rule", () => {
   it("refuses a private channel to a run answering in a public one", async () => {
-    slackResponses["conversations.info"] = { ok: true, channel: { id: "G333", is_private: true } };
-    const out = await slackRead(["history", "G333"], { expectFailure: true });
+    slackResponses["conversations.info"] = { ok: true, channel: { id: "G444", is_private: true } };
+    const out = await slackRead(["history", "G444"], { expectFailure: true });
     assert.match(out, /may only read public channels/);
   });
 
-  it("allows it when the run is itself private", async () => {
+  it("allows the run's own channel without a membership round-trip", async () => {
+    // The origin channel's messages are already in the prompt, so gating it
+    // would deny access to something the model was handed anyway.
     const out = await slackRead(["history", "G333"], { capability: privateRun() });
     assert.match(out, /rollback done/);
   });
@@ -251,6 +295,57 @@ describe("the tier rule", () => {
     const out = await slackRead(["history", "C999"], { expectFailure: true });
     assert.match(out, /may only read public channels/);
   });
+
+  it("treats a channel object with no is_private field as unconfirmed", async () => {
+    // The bug this guards: `is_private ?? true` reads as private, but "we don't
+    // understand this object" must not be the thing that GRANTS private access.
+    const { fetchChannelInfo } = await import("../lib/slack.js");
+    slackResponses["conversations.info"] = { ok: true, channel: { id: "C111" } };
+    const info = await fetchChannelInfo("C111");
+    assert.equal(info.isPrivate, true, "cautious for the memory tier");
+    assert.equal(info.privacyKnown, false, "but never counted as a confirmed private channel");
+  });
+});
+
+describe("private channels answer to the asker, not to the bot", () => {
+  before(() => {
+    slackResponses["conversations.info"] = { ok: true, channel: { id: "G555", is_private: true } };
+  });
+
+  it("refuses a private channel the person who asked is not in", async () => {
+    // The whole point: Joestar is in G555 (or this would fail differently), but
+    // U99NOPE is not, and being able to DM Joestar is not membership.
+    const out = await slackRead(["history", "G555"], {
+      capability: privateRun("U99NOPE"),
+      expectFailure: true,
+    });
+    assert.match(out, /not a member/);
+    assert.doesNotMatch(out, /rollback done/);
+  });
+
+  it("allows one they are in", async () => {
+    const out = await slackRead(["history", "G555"], { capability: privateRun("U04ABC") });
+    assert.match(out, /rollback done/);
+  });
+
+  it("refuses when the capability names nobody", async () => {
+    const anonymous = mintCapability({ channelId: "G333", isPrivate: true }, 60_000);
+    const out = await slackRead(["history", "G555"], {
+      capability: anonymous,
+      expectFailure: true,
+    });
+    assert.match(out, /cannot tell who is asking/);
+  });
+
+  it("denies rather than allows when the member list cannot be read", async () => {
+    slackResponses["conversations.members"] = { ok: false, error: "missing_scope" };
+    const out = await slackRead(["history", "G555"], {
+      capability: privateRun("U04ABC"),
+      expectFailure: true,
+    });
+    assert.match(out, /not a member/);
+    slackResponses["conversations.members"] = { ok: true, members: ["U04ABC", "U05XYZ"] };
+  });
 });
 
 describe("errors and boundaries", () => {
@@ -259,6 +354,18 @@ describe("errors and boundaries", () => {
     slackResponses["conversations.history"] = { ok: false, error: "not_in_channel" };
     const out = await slackRead(["history", "C111"], { expectFailure: true });
     assert.match(out, /\/invite @Joestar/);
+  });
+
+  it("rejects an inherited Object.prototype member as an action", async () => {
+    // `ACTIONS["constructor"]` is truthy, so a bare lookup ran `Object(body)`
+    // and answered 200 with an echo of the request where a 400 belongs.
+    const res = await fetch(`http://127.0.0.1:${PORT}/api/sandbox/slack`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${publicRun()}`, "content-type": "application/json" },
+      body: JSON.stringify({ action: "constructor" }),
+    });
+    assert.equal(res.status, 400);
+    assert.match((await res.json()).error, /unknown action/);
   });
 
   it("offers no way to write to Slack", async () => {

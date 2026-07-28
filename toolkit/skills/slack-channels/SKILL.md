@@ -40,9 +40,16 @@ private channels or DMs at all, ever. And Slack only permits it on a turn where 
 Joestar**; on a bare threaded follow-up it returns an error saying exactly that. If you hit that,
 ask the user to tag you and try again.
 
-One more wall you will not see but should respect: a run answering in a **public** channel is
-refused reads of **private** channels outright. That is deliberate — otherwise a public thread
-becomes a way to launder a private one.
+Two more walls you will not see but should respect.
+
+A run answering in a **public** channel is refused reads of **private** channels outright. That is
+deliberate — otherwise a public thread becomes a way to launder a private one.
+
+And a private channel is only readable if **the person who asked** is a member of it — not merely
+if Joestar is. Joestar sits in channels that most of the people who message it are not in, so its
+own access is the wrong measure of what any given user is entitled to see. Practically: someone
+DMing you cannot use you to read a private channel they were left out of, and you will get a 403
+saying so. Relay that as the answer, don't look for a way around it.
 
 ## How to actually use it
 
