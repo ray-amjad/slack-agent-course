@@ -132,6 +132,13 @@ export const template = Template()
   )
   // Installed globally so the sandbox exposes it simply as `claude`.
   .npmInstall("@anthropic-ai/claude-code@latest", { g: true })
+  // OpenAI's Codex CLI, so the agent can get a second opinion from a model that
+  // isn't itself — an independent review, an adversarial "how does this break",
+  // or a consult (see toolkit/skills/codex). The binary is baked in here; the
+  // credential is not, because it is a live OAuth token and an image is the one
+  // place a secret has no business living. lib/claude-sandbox.js writes
+  // ~/.codex/auth.json into each sandbox instead, from CODEX_AUTH_JSON.
+  .npmInstall("@openai/codex@latest", { g: true })
   // Playwright, for screenshotting/recording a locally-running app (e.g. a
   // Next.js dev server) and dropping the result into /tmp/outputs. Installed
   // globally like claude-code above, purely so `npx playwright` resolves
