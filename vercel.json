@@ -4,6 +4,9 @@
     "api/slack/events.js": {
       "maxDuration": 800,
       "includeFiles": "toolkit/**"
+    },
+    "api/sandbox/slack.js": {
+      "maxDuration": 30
     }
   }
 }
