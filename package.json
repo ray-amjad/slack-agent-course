@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Slack bot that runs your prompt through Claude Code in an E2B sandbox and replies in-thread",
   "scripts": {
-    "template:build": "node e2b/build.js"
+    "template:build": "node e2b/build.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@slack/web-api": "^8.0.0",
