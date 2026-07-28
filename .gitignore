@@ -1,7 +1,10 @@
 node_modules
 .vercel
-.env
-.env*.local
+# Every .env* form except the checked-in template. `vercel env pull` writes real
+# production secrets into whatever filename you hand it, so allowlist rather
+# than denylist — a stray `.env.check` is otherwise a token in a commit.
+.env*
+!.env.example
 
 # Personal instructions to Claude Code — not course material
 CLAUDE.local.md

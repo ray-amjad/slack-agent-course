@@ -194,14 +194,22 @@ const ACTIONS = {
       contextChannel: capability.channelId,
     });
 
+    // `assistant.search.context` does NOT return message-shaped objects: the
+    // text is `content` (not `text`), the timestamp is `message_ts` (not `ts`),
+    // and the channel is two flat fields rather than a nested object. Getting
+    // this wrong fails silently — every field reads `undefined` and the search
+    // still "works", returning the right number of empty results. A live
+    // round-trip is what caught it; the `||` fallbacks below are deliberate, so
+    // a future shape change degrades instead of blanking.
     return {
       query: body.query,
       results: results.map((m) => ({
-        text: clip(m.text || ""),
-        user: m.author_user_id || m.user || null,
-        channel: m.channel?.name ? `#${m.channel.name}` : m.channel?.id || null,
-        channelId: m.channel?.id || null,
-        ts: m.ts,
+        text: clip(m.content || m.text || ""),
+        user: m.author_name || m.author_user_id || m.user || null,
+        isBot: Boolean(m.is_author_bot),
+        channel: m.channel_name ? `#${m.channel_name}` : m.channel_id || null,
+        channelId: m.channel_id || null,
+        ts: m.message_ts || m.ts || null,
         permalink: m.permalink || null,
       })),
       note: "Search covers PUBLIC channels only — a bot token cannot search private channels or DMs.",
