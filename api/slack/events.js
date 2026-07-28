@@ -480,7 +480,12 @@ async function respond({ event, channel, threadTs, prompt, files, transcript }) 
   }
 
   const { text, uploadedFiles = [] } = outcome.result;
-  const body = text
+  // `.trim()`, not just truthiness. A run that ends with whitespace-only text —
+  // a lone newline is the one seen in the wild, from a prompt that asked for
+  // output and no commentary — is truthy, so a bare `text ?` sails past both
+  // fallbacks and posts a genuinely blank message into the thread. From the
+  // outside that is indistinguishable from the bot silently failing.
+  const body = text?.trim()
     ? toMrkdwn(text)
     : uploadedFiles.length
       ? "_Done — see the attached file(s)._"
