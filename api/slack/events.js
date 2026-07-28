@@ -11,7 +11,7 @@ import {
   completeUpload,
   downloadSlackFile,
   extractPrompt,
-  fetchChannelTopic,
+  fetchChannelInfo,
   fetchThreadReplies,
   finalize,
   getBotUserId,
@@ -283,9 +283,9 @@ async function respond({ event, channel, threadTs, prompt, files, transcript }) 
     inputPaths.push(`/tmp/inputs/${name}`);
   }
 
-  const [github, channelTopic] = await Promise.all([
+  const [github, channelInfo] = await Promise.all([
     mintGithubToken(),
-    fetchChannelTopic(channel),
+    fetchChannelInfo(channel),
   ]);
 
   const finalPrompt = buildPrompt({
@@ -293,7 +293,7 @@ async function respond({ event, channel, threadTs, prompt, files, transcript }) 
     transcript,
     inputPaths,
     github: github.status,
-    channelTopic,
+    channelTopic: channelInfo.topic,
   });
   const ts = await postThinking({ channel, threadTs });
   const startedAt = Date.now();
@@ -320,8 +320,14 @@ async function respond({ event, channel, threadTs, prompt, files, transcript }) 
     const result = await runClaude({
       prompt: finalPrompt,
       inputFiles,
+      // channelId and threadTs together name this thread's sandbox and derive
+      // its session id. channelId does double duty as the long-term memory key
+      // — by ID, never by channel name (names drift) and never by user (nothing
+      // here is personal); isPrivate decides whether this run may write to the
+      // shared workspace tier.
       channelId: channel,
       threadTs,
+      isPrivate: channelInfo.isPrivate,
       githubToken: github.token,
       onProgress: (tool) => {
         latestTool = tool;
