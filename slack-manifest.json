@@ -21,7 +21,9 @@
         "groups:read",
         "reactions:write",
         "files:write",
-        "files:read"
+        "files:read",
+        "search:read.public",
+        "search:read.users"
       ]
     }
   },
