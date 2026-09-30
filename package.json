@@ -15,6 +15,7 @@
   },
   "comment:overrides": "e2b depends on chalk ^5 (ESM-only). Vercel's bundler rewrites e2b's lazy import('chalk') into require('chalk'), which ESM chalk rejects (ERR_REQUIRE_ESM) and crashes the function at load. chalk is only used for e2b's build logs, never on the request path, so pinning to the CommonJS v4 line is safe and makes require() work.",
   "overrides": {
-    "chalk": "^4.1.2"
+    "chalk": "^4.1.2",
+    "brace-expansion": "^5.0.11"
   }
 }
